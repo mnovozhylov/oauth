@@ -14,7 +14,8 @@
 // service provider on behalf of the user.
 //
 // Caveats:
-//      - Currently only supports HMAC-SHA1 and RSA-SHA1 signatures.
+//      - Currently only supports HMAC and RSA signatures.
+//      - Currently only supports SHA1 and SHA256 hashes.
 //      - Currently only supports OAuth 1.0
 //
 // Overview of how to use this library:
@@ -41,7 +42,6 @@ import (
 	"crypto/hmac"
 	cryptoRand "crypto/rand"
 	"crypto/rsa"
-	"crypto/sha1"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -54,14 +54,18 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
-	OAUTH_VERSION              = "1.0"
-	SIGNATURE_METHOD_HMAC_SHA1 = "HMAC-SHA1"
-	SIGNATURE_METHOD_RSA_SHA1  = "RSA-SHA1"
+	OAUTH_VERSION         = "1.0"
+	SIGNATURE_METHOD_HMAC = "HMAC-"
+	SIGNATURE_METHOD_RSA  = "RSA-"
 
+	HTTP_AUTH_HEADER       = "Authorization"
+	OAUTH_HEADER           = "OAuth "
+	BODY_HASH_PARAM        = "oauth_body_hash"
 	CALLBACK_PARAM         = "oauth_callback"
 	CONSUMER_KEY_PARAM     = "oauth_consumer_key"
 	NONCE_PARAM            = "oauth_nonce"
@@ -74,6 +78,11 @@ const (
 	VERIFIER_PARAM         = "oauth_verifier"
 	VERSION_PARAM          = "oauth_version"
 )
+
+var HASH_METHOD_MAP = map[crypto.Hash]string{
+	crypto.SHA1:   "SHA1",
+	crypto.SHA256: "SHA256",
+}
 
 // TODO(mrjones) Do we definitely want separate "Request" and "Access" token classes?
 // They're identical structurally, but used for different purposes.
@@ -126,6 +135,14 @@ type ServiceProvider struct {
 	AuthorizeTokenUrl string
 	AccessTokenUrl    string
 	HttpMethod        string
+	BodyHash          bool
+	IgnoreTimestamp   bool
+
+	// Enables non spec-compliant behavior:
+	// Allow parameters to be passed in the query string rather
+	// than the body.
+	// See https://github.com/mrjones/oauth/pull/63
+	SignQueryParams bool
 }
 
 func (sp *ServiceProvider) httpMethod() string {
@@ -134,6 +151,26 @@ func (sp *ServiceProvider) httpMethod() string {
 	}
 
 	return "GET"
+}
+
+// lockedNonceGenerator wraps a non-reentrant random number generator with a
+// lock
+type lockedNonceGenerator struct {
+	nonceGenerator nonceGenerator
+	lock           sync.Mutex
+}
+
+func newLockedNonceGenerator(c clock) *lockedNonceGenerator {
+	return &lockedNonceGenerator{
+		nonceGenerator: rand.New(rand.NewSource(c.Nanos())),
+	}
+}
+
+func (n *lockedNonceGenerator) Int63() int64 {
+	n.lock.Lock()
+	r := n.nonceGenerator.Int63()
+	n.lock.Unlock()
+	return r
 }
 
 // Consumers are stateless, you can call the various methods (GetRequestTokenAndUrl,
@@ -171,7 +208,8 @@ type Consumer struct {
 	AdditionalHeaders map[string][]string
 
 	// Private seams for mocking dependencies when testing
-	clock          clock
+	clock clock
+	// Seeded generators are not reentrant
 	nonceGenerator nonceGenerator
 	signer         signer
 }
@@ -186,7 +224,7 @@ func newConsumer(consumerKey string, serviceProvider ServiceProvider, httpClient
 		serviceProvider: serviceProvider,
 		clock:           clock,
 		HttpClient:      httpClient,
-		nonceGenerator:  rand.New(rand.NewSource(clock.Nanos())),
+		nonceGenerator:  newLockedNonceGenerator(clock),
 
 		AdditionalParams:                 make(map[string]string),
 		AdditionalAuthorizationUrlParams: make(map[string]string),
@@ -205,8 +243,9 @@ func NewConsumer(consumerKey string, consumerSecret string,
 	serviceProvider ServiceProvider) *Consumer {
 	consumer := newConsumer(consumerKey, serviceProvider, nil)
 
-	consumer.signer = &SHA1Signer{
+	consumer.signer = &HMACSigner{
 		consumerSecret: consumerSecret,
+		hashFunc:       crypto.SHA1,
 	}
 
 	return consumer
@@ -229,8 +268,38 @@ func NewCustomHttpClientConsumer(consumerKey string, consumerSecret string,
 	serviceProvider ServiceProvider, httpClient *http.Client) *Consumer {
 	consumer := newConsumer(consumerKey, serviceProvider, httpClient)
 
-	consumer.signer = &SHA1Signer{
+	consumer.signer = &HMACSigner{
 		consumerSecret: consumerSecret,
+		hashFunc:       crypto.SHA1,
+	}
+
+	return consumer
+}
+
+// Creates a new Consumer instance, with a HMAC signer
+//      - consumerKey and consumerSecret:
+//        values you should obtain from the ServiceProvider when you register your
+//        application.
+//
+//      - hashFunc:
+//        the crypto.Hash to use for signatures
+//
+//      - serviceProvider:
+//        see the documentation for ServiceProvider for how to create this.
+//
+//      - httpClient:
+//        Provides a custom implementation of the httpClient used under the hood
+//        to make the request.  This is especially useful if you want to use
+//        Google App Engine. Can be nil for default.
+//
+func NewCustomConsumer(consumerKey string, consumerSecret string,
+	hashFunc crypto.Hash, serviceProvider ServiceProvider,
+	httpClient *http.Client) *Consumer {
+	consumer := newConsumer(consumerKey, serviceProvider, httpClient)
+
+	consumer.signer = &HMACSigner{
+		consumerSecret: consumerSecret,
+		hashFunc:       hashFunc,
 	}
 
 	return consumer
@@ -253,6 +322,40 @@ func NewRSAConsumer(consumerKey string, privateKey *rsa.PrivateKey,
 
 	consumer.signer = &RSASigner{
 		privateKey: privateKey,
+		hashFunc:   crypto.SHA1,
+		rand:       cryptoRand.Reader,
+	}
+
+	return consumer
+}
+
+// Creates a new Consumer instance, with a RSA signer
+//      - consumerKey:
+//        value you should obtain from the ServiceProvider when you register your
+//        application.
+//
+//      - privateKey:
+//        the private key to use for signatures
+//
+//      - hashFunc:
+//        the crypto.Hash to use for signatures
+//
+//      - serviceProvider:
+//        see the documentation for ServiceProvider for how to create this.
+//
+//      - httpClient:
+//        Provides a custom implementation of the httpClient used under the hood
+//        to make the request.  This is especially useful if you want to use
+//        Google App Engine. Can be nil for default.
+//
+func NewCustomRSAConsumer(consumerKey string, privateKey *rsa.PrivateKey,
+	hashFunc crypto.Hash, serviceProvider ServiceProvider,
+	httpClient *http.Client) *Consumer {
+	consumer := newConsumer(consumerKey, serviceProvider, httpClient)
+
+	consumer.signer = &RSASigner{
+		privateKey: privateKey,
+		hashFunc:   hashFunc,
 		rand:       cryptoRand.Reader,
 	}
 
@@ -286,8 +389,14 @@ func NewRSAConsumer(consumerKey string, privateKey *rsa.PrivateKey,
 //      - err:
 //        Set only if there was an error, nil otherwise.
 func (c *Consumer) GetRequestTokenAndUrl(callbackUrl string) (rtoken *RequestToken, loginUrl string, err error) {
-	params := c.baseParams(c.consumerKey, c.AdditionalParams)
-	params.Add(CALLBACK_PARAM, callbackUrl)
+	return c.GetRequestTokenAndUrlWithParams(callbackUrl, c.AdditionalParams)
+}
+
+func (c *Consumer) GetRequestTokenAndUrlWithParams(callbackUrl string, additionalParams map[string]string) (rtoken *RequestToken, loginUrl string, err error) {
+	params := c.baseParams(c.consumerKey, additionalParams)
+	if callbackUrl != "" {
+		params.Add(CALLBACK_PARAM, callbackUrl)
+	}
 
 	req := &request{
 		method:      c.serviceProvider.httpMethod(),
@@ -312,7 +421,7 @@ func (c *Consumer) GetRequestTokenAndUrl(callbackUrl string) (rtoken *RequestTok
 	for k, v := range c.AdditionalAuthorizationUrlParams {
 		loginParams.Set(k, v)
 	}
-	loginParams.Set("oauth_token", requestToken.Token)
+	loginParams.Set(TOKEN_PARAM, requestToken.Token)
 
 	loginUrl = c.serviceProvider.AuthorizeTokenUrl + "?" + loginParams.Encode()
 
@@ -337,12 +446,17 @@ func (c *Consumer) GetRequestTokenAndUrl(callbackUrl string) (rtoken *RequestTok
 //      - err:
 //        Set only if there was an error, nil otherwise.
 func (c *Consumer) AuthorizeToken(rtoken *RequestToken, verificationCode string) (atoken *AccessToken, err error) {
-	params := map[string]string{
-		VERIFIER_PARAM: verificationCode,
-		TOKEN_PARAM:    rtoken.Token,
-	}
+	return c.AuthorizeTokenWithParams(rtoken, verificationCode, c.AdditionalParams)
+}
 
-	return c.makeAccessTokenRequest(params, rtoken.Secret)
+func (c *Consumer) AuthorizeTokenWithParams(rtoken *RequestToken, verificationCode string, additionalParams map[string]string) (atoken *AccessToken, err error) {
+	params := map[string]string{
+		TOKEN_PARAM: rtoken.Token,
+	}
+	if verificationCode != "" {
+		params[VERIFIER_PARAM] = verificationCode
+	}
+	return c.makeAccessTokenRequestWithParams(params, rtoken.Secret, additionalParams)
 }
 
 // Use the service provider to refresh the AccessToken for a given session.
@@ -392,7 +506,11 @@ func (c *Consumer) RefreshToken(accessToken *AccessToken) (atoken *AccessToken, 
 //      - err:
 //        Set only if there was an error, nil otherwise.
 func (c *Consumer) makeAccessTokenRequest(params map[string]string, secret string) (atoken *AccessToken, err error) {
-	orderedParams := c.baseParams(c.consumerKey, c.AdditionalParams)
+	return c.makeAccessTokenRequestWithParams(params, secret, c.AdditionalParams)
+}
+
+func (c *Consumer) makeAccessTokenRequestWithParams(params map[string]string, secret string, additionalParams map[string]string) (atoken *AccessToken, err error) {
+	orderedParams := c.baseParams(c.consumerKey, additionalParams)
 	for key, value := range params {
 		orderedParams.Add(key, value)
 	}
@@ -558,8 +676,12 @@ func (c *Consumer) makeAuthorizedRequestReader(method string, urlString string, 
 
 	} else {
 		// TODO(mrjones): validate that we're not overrideing an exising body?
-		request.Body = ioutil.NopCloser(strings.NewReader(vals.Encode()))
 		request.ContentLength = int64(len(vals.Encode()))
+		if request.ContentLength == 0 {
+			request.Body = nil
+		} else {
+			request.Body = ioutil.NopCloser(strings.NewReader(vals.Encode()))
+		}
 	}
 
 	for k, vs := range c.AdditionalHeaders {
@@ -610,6 +732,9 @@ func (c *Consumer) makeAuthorizedRequestReader(method string, urlString string, 
 	rt := RoundTripper{consumer: c, token: token}
 
 	resp, err = rt.RoundTrip(request)
+	if err != nil {
+		return resp, err
+	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		defer resp.Body.Close()
@@ -626,7 +751,9 @@ func (c *Consumer) makeAuthorizedRequestReader(method string, urlString string, 
 	return resp, nil
 }
 
-func clone(src *http.Request) *http.Request {
+// cloneReq clones the src http.Request, making deep copies of the Header and
+// the URL but shallow copies of everything else
+func cloneReq(src *http.Request) *http.Request {
 	dst := &http.Request{}
 	*dst = *src
 
@@ -634,6 +761,18 @@ func clone(src *http.Request) *http.Request {
 	for k, s := range src.Header {
 		dst.Header[k] = append([]string(nil), s...)
 	}
+
+	if src.URL != nil {
+		dst.URL = cloneURL(src.URL)
+	}
+
+	return dst
+}
+
+// cloneURL shallow clones the src *url.URL
+func cloneURL(src *url.URL) *url.URL {
+	dst := &url.URL{}
+	*dst = *src
 
 	return dst
 }
@@ -648,29 +787,33 @@ func canonicalizeUrl(u *url.URL) string {
 	return buf.String()
 }
 
-func (rt *RoundTripper) RoundTrip(userRequest *http.Request) (*http.Response, error) {
-	serverRequest := clone(userRequest)
-
-	allParams := rt.consumer.baseParams(
-		rt.consumer.consumerKey, rt.consumer.AdditionalParams)
-
-	// Do not add the "oauth_token" parameter, if the access token has not been
-	// specified. By omitting this parameter when it is not specified, allows
-	// two-legged OAuth calls.
-	if len(rt.token.Token) > 0 {
-		allParams.Add(TOKEN_PARAM, rt.token.Token)
+func getBody(request *http.Request) ([]byte, error) {
+	if request.Body == nil {
+		return nil, nil
 	}
-	authParams := allParams.Clone()
+	defer request.Body.Close()
+	originalBody, err := ioutil.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
 
-	// TODO(mrjones): put these directly into the paramPairs below?
+	// We have to re-install the body (because we've ruined it by reading it).
+	if len(originalBody) > 0 {
+		request.Body = ioutil.NopCloser(bytes.NewReader(originalBody))
+	} else {
+		request.Body = nil
+	}
+	return originalBody, nil
+}
+
+func parseBody(request *http.Request) (map[string]string, error) {
 	userParams := map[string]string{}
 
-	originalBody := []byte{}
 	// TODO(mrjones): factor parameter extraction into a separate method
-	if userRequest.Header.Get("Content-Type") !=
+	if request.Header.Get("Content-Type") !=
 		"application/x-www-form-urlencoded" {
 		// Most of the time we get parameters from the query string:
-		for k, vs := range userRequest.URL.Query() {
+		for k, vs := range request.URL.Query() {
 			if len(vs) != 1 {
 				return nil, fmt.Errorf("Must have exactly one value per param")
 			}
@@ -679,14 +822,12 @@ func (rt *RoundTripper) RoundTrip(userRequest *http.Request) (*http.Response, er
 		}
 	} else {
 		// x-www-form-urlencoded parameters come from the body instead:
-		var err error
-		defer userRequest.Body.Close()
-		originalBody, err = ioutil.ReadAll(userRequest.Body)
+		body, err := getBody(request)
 		if err != nil {
 			return nil, err
 		}
 
-		params, err := url.ParseQuery(string(originalBody))
+		params, err := url.ParseQuery(string(body))
 		if err != nil {
 			return nil, err
 		}
@@ -700,31 +841,87 @@ func (rt *RoundTripper) RoundTrip(userRequest *http.Request) (*http.Response, er
 		}
 	}
 
+	return userParams, nil
+}
+
+func paramsToSortedPairs(params map[string]string) pairs {
 	// Sort parameters alphabetically
-	paramPairs := make(pairs, len(userParams))
+	paramPairs := make(pairs, len(params))
 	i := 0
-	for key, value := range userParams {
+	for key, value := range params {
 		paramPairs[i] = pair{key: key, value: value}
 		i++
 	}
 	sort.Sort(paramPairs)
 
-	separator := ""
-	encodedUserParams := ""
+	return paramPairs
+}
+
+func calculateBodyHash(request *http.Request, s signer) (string, error) {
+	if request.Header.Get("Content-Type") ==
+		"application/x-www-form-urlencoded" {
+		return "", nil
+	}
+
+	var body []byte
+
+	if request.Body != nil {
+		var err error
+		body, err = getBody(request)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	h := s.HashFunc().New()
+	h.Write(body)
+	rawSignature := h.Sum(nil)
+
+	return base64.StdEncoding.EncodeToString(rawSignature), nil
+}
+
+func (rt *RoundTripper) RoundTrip(userRequest *http.Request) (*http.Response, error) {
+	serverRequest := cloneReq(userRequest)
+
+	allParams := rt.consumer.baseParams(
+		rt.consumer.consumerKey, rt.consumer.AdditionalParams)
+
+	// Do not add the "oauth_token" parameter, if the access token has not been
+	// specified. By omitting this parameter when it is not specified, allows
+	// two-legged OAuth calls.
+	if len(rt.token.Token) > 0 {
+		allParams.Add(TOKEN_PARAM, rt.token.Token)
+	}
+
+	if rt.consumer.serviceProvider.BodyHash {
+		bodyHash, err := calculateBodyHash(serverRequest, rt.consumer.signer)
+		if err != nil {
+			return nil, err
+		}
+
+		if bodyHash != "" {
+			allParams.Add(BODY_HASH_PARAM, bodyHash)
+		}
+	}
+
+	authParams := allParams.Clone()
+
+	// TODO(mrjones): put these directly into the paramPairs below?
+	userParams, err := parseBody(serverRequest)
+	if err != nil {
+		return nil, err
+	}
+	paramPairs := paramsToSortedPairs(userParams)
+
 	for i := range paramPairs {
 		allParams.Add(paramPairs[i].key, paramPairs[i].value)
-		thisPair := escape(paramPairs[i].key) + "=" + escape(paramPairs[i].value)
-		encodedUserParams += separator + thisPair
-		separator = "&"
 	}
 
-	if len(originalBody) > 0 {
-		// If there was a body, we have to re-install it
-		// (because we've ruined it by reading it).
-		serverRequest.Body = ioutil.NopCloser(strings.NewReader(string(originalBody)))
+	signingURL := cloneURL(serverRequest.URL)
+	if host := serverRequest.Host; host != "" {
+		signingURL.Host = host
 	}
-
-	baseString := rt.consumer.requestString(userRequest.Method, canonicalizeUrl(userRequest.URL), allParams)
+	baseString := rt.consumer.requestString(serverRequest.Method, canonicalizeUrl(signingURL), allParams)
 
 	signature, err := rt.consumer.signer.Sign(baseString, rt.token.Secret)
 	if err != nil {
@@ -734,14 +931,16 @@ func (rt *RoundTripper) RoundTrip(userRequest *http.Request) (*http.Response, er
 	authParams.Add(SIGNATURE_PARAM, signature)
 
 	// Set auth header.
-	oauthHdr := "OAuth "
+	oauthHdr := OAUTH_HEADER
 	for pos, key := range authParams.Keys() {
-		if pos > 0 {
-			oauthHdr += ","
+		for innerPos, value := range authParams.Get(key) {
+			if pos+innerPos > 0 {
+				oauthHdr += ","
+			}
+			oauthHdr += key + "=\"" + value + "\""
 		}
-		oauthHdr += key + "=\"" + authParams.Get(key) + "\""
 	}
-	serverRequest.Header.Add("Authorization", oauthHdr)
+	serverRequest.Header.Add(HTTP_AUTH_HEADER, oauthHdr)
 
 	if rt.consumer.debug {
 		fmt.Printf("Request: %v\n", serverRequest)
@@ -786,7 +985,9 @@ type key interface {
 
 type signer interface {
 	Sign(message string, tokenSecret string) (string, error)
+	Verify(message string, signature string) error
 	SignatureMethod() string
+	HashFunc() crypto.Hash
 	Debug(enabled bool)
 }
 
@@ -888,24 +1089,27 @@ func parseAdditionalData(parts url.Values) map[string]string {
 	return params
 }
 
-type SHA1Signer struct {
+type HMACSigner struct {
 	consumerSecret string
+	hashFunc       crypto.Hash
 	debug          bool
 }
 
-func (s *SHA1Signer) Debug(enabled bool) {
+func (s *HMACSigner) Debug(enabled bool) {
 	s.debug = enabled
 }
 
-func (s *SHA1Signer) Sign(message string, tokenSecret string) (string, error) {
+func (s *HMACSigner) Sign(message string, tokenSecret string) (string, error) {
 	key := escape(s.consumerSecret) + "&" + escape(tokenSecret)
 	if s.debug {
 		fmt.Println("Signing:", message)
 		fmt.Println("Key:", key)
 	}
-	hashfun := hmac.New(sha1.New, []byte(key))
-	hashfun.Write([]byte(message))
-	rawSignature := hashfun.Sum(nil)
+
+	h := hmac.New(s.HashFunc().New, []byte(key))
+	h.Write([]byte(message))
+	rawSignature := h.Sum(nil)
+
 	base64signature := base64.StdEncoding.EncodeToString(rawSignature)
 	if s.debug {
 		fmt.Println("Base64 signature:", base64signature)
@@ -913,14 +1117,38 @@ func (s *SHA1Signer) Sign(message string, tokenSecret string) (string, error) {
 	return base64signature, nil
 }
 
-func (s *SHA1Signer) SignatureMethod() string {
-	return SIGNATURE_METHOD_HMAC_SHA1
+func (s *HMACSigner) Verify(message string, signature string) error {
+	if s.debug {
+		fmt.Println("Verifying Base64 signature:", signature)
+	}
+	validSignature, err := s.Sign(message, "")
+	if err != nil {
+		return err
+	}
+
+	if validSignature != signature {
+		decodedSigniture, _ := url.QueryUnescape(signature)
+		if validSignature != decodedSigniture {
+			return fmt.Errorf("signature did not match")
+		}
+	}
+
+	return nil
+}
+
+func (s *HMACSigner) SignatureMethod() string {
+	return SIGNATURE_METHOD_HMAC + HASH_METHOD_MAP[s.HashFunc()]
+}
+
+func (s *HMACSigner) HashFunc() crypto.Hash {
+	return s.hashFunc
 }
 
 type RSASigner struct {
 	debug      bool
 	rand       io.Reader
 	privateKey *rsa.PrivateKey
+	hashFunc   crypto.Hash
 }
 
 func (s *RSASigner) Debug(enabled bool) {
@@ -932,12 +1160,11 @@ func (s *RSASigner) Sign(message string, tokenSecret string) (string, error) {
 		fmt.Println("Signing:", message)
 	}
 
-	hashFunc := crypto.SHA1
-	h := hashFunc.New()
+	h := s.HashFunc().New()
 	h.Write([]byte(message))
 	digest := h.Sum(nil)
 
-	signature, err := rsa.SignPKCS1v15(s.rand, s.privateKey, hashFunc, digest)
+	signature, err := rsa.SignPKCS1v15(s.rand, s.privateKey, s.HashFunc(), digest)
 	if err != nil {
 		return "", nil
 	}
@@ -950,8 +1177,30 @@ func (s *RSASigner) Sign(message string, tokenSecret string) (string, error) {
 	return base64signature, nil
 }
 
+func (s *RSASigner) Verify(message string, base64signature string) error {
+	if s.debug {
+		fmt.Println("Verifying:", message)
+		fmt.Println("Verifying Base64 signature:", base64signature)
+	}
+
+	h := s.HashFunc().New()
+	h.Write([]byte(message))
+	digest := h.Sum(nil)
+
+	signature, err := base64.StdEncoding.DecodeString(base64signature)
+	if err != nil {
+		return err
+	}
+
+	return rsa.VerifyPKCS1v15(&s.privateKey.PublicKey, s.HashFunc(), digest, signature)
+}
+
 func (s *RSASigner) SignatureMethod() string {
-	return SIGNATURE_METHOD_RSA_SHA1
+	return SIGNATURE_METHOD_RSA + HASH_METHOD_MAP[s.HashFunc()]
+}
+
+func (s *RSASigner) HashFunc() crypto.Hash {
+	return s.hashFunc
 }
 
 func escape(s string) string {
@@ -977,12 +1226,14 @@ func isEscapable(b byte) bool {
 func (c *Consumer) requestString(method string, url string, params *OrderedParams) string {
 	result := method + "&" + escape(url)
 	for pos, key := range params.Keys() {
-		if pos == 0 {
-			result += "&"
-		} else {
-			result += escape("&")
+		for innerPos, value := range params.Get(key) {
+			if pos+innerPos == 0 {
+				result += "&"
+			} else {
+				result += escape("&")
+			}
+			result += escape(fmt.Sprintf("%s=%s", key, value))
 		}
-		result += escape(fmt.Sprintf("%s=%s", key, params.Get(key)))
 	}
 	return result
 }
@@ -1038,10 +1289,12 @@ func (c *Consumer) httpExecute(
 	req.Header = http.Header{}
 	oauthHdr := "OAuth "
 	for pos, key := range oauthParams.Keys() {
-		if pos > 0 {
-			oauthHdr += ","
+		for innerPos, value := range oauthParams.Get(key) {
+			if pos+innerPos > 0 {
+				oauthHdr += ","
+			}
+			oauthHdr += key + "=\"" + value + "\""
 		}
-		oauthHdr += key + "=\"" + oauthParams.Get(key) + "\""
 	}
 	req.Header.Add("Authorization", oauthHdr)
 
@@ -1093,22 +1346,41 @@ func (c *Consumer) httpExecute(
 }
 
 //
+// String Sorting helpers
+//
+
+type ByValue []string
+
+func (a ByValue) Len() int {
+	return len(a)
+}
+
+func (a ByValue) Swap(i, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a ByValue) Less(i, j int) bool {
+	return a[i] < a[j]
+}
+
+//
 // ORDERED PARAMS
 //
 
 type OrderedParams struct {
-	allParams   map[string]string
+	allParams   map[string][]string
 	keyOrdering []string
 }
 
 func NewOrderedParams() *OrderedParams {
 	return &OrderedParams{
-		allParams:   make(map[string]string),
+		allParams:   make(map[string][]string),
 		keyOrdering: make([]string, 0),
 	}
 }
 
-func (o *OrderedParams) Get(key string) string {
+func (o *OrderedParams) Get(key string) []string {
+	sort.Sort(ByValue(o.allParams[key]))
 	return o.allParams[key]
 }
 
@@ -1122,8 +1394,13 @@ func (o *OrderedParams) Add(key, value string) {
 }
 
 func (o *OrderedParams) AddUnescaped(key, value string) {
-	o.allParams[key] = value
-	o.keyOrdering = append(o.keyOrdering, key)
+	if _, exists := o.allParams[key]; !exists {
+		o.keyOrdering = append(o.keyOrdering, key)
+		o.allParams[key] = make([]string, 1)
+		o.allParams[key][0] = value
+	} else {
+		o.allParams[key] = append(o.allParams[key], value)
+	}
 }
 
 func (o *OrderedParams) Len() int {
@@ -1141,7 +1418,9 @@ func (o *OrderedParams) Swap(i int, j int) {
 func (o *OrderedParams) Clone() *OrderedParams {
 	clone := NewOrderedParams()
 	for _, key := range o.Keys() {
-		clone.AddUnescaped(key, o.Get(key))
+		for _, value := range o.Get(key) {
+			clone.AddUnescaped(key, value)
+		}
 	}
 	return clone
 }

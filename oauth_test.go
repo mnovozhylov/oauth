@@ -1,10 +1,13 @@
 package oauth
 
 import (
+	"crypto"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -32,6 +35,59 @@ func (m *Mocks) install(c *Consumer) {
 	c.clock = m.clock
 	c.nonceGenerator = m.nonceGenerator
 	c.signer = m.signer
+}
+
+func TestCloneReq(t *testing.T) {
+	originalHeaders := http.Header{
+		"KeyA": []string{"ValueA", "ValueB"},
+		"KeyB": []string{"ValueB"},
+	}
+	originalURL, err := url.Parse("http://hostname.com/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	original := &http.Request{
+		Header: originalHeaders,
+		URL:    originalURL,
+	}
+
+	clone := cloneReq(original)
+
+	if !reflect.DeepEqual(original.Header, clone.Header) {
+		t.Fatalf("cloneReq did not correctly deep copy Header")
+	}
+
+	// If I delete something from the original they should no longer be equal
+	delete(originalHeaders, "KeyA")
+	if reflect.DeepEqual(original.Header, clone.Header) {
+		t.Fatalf("cloneReq should deep copy the Header")
+	}
+
+	if original.URL == clone.URL {
+		t.Fatalf("cloneReq should deep copy the URL")
+	}
+
+	if !reflect.DeepEqual(original.URL, clone.URL) {
+		t.Fatalf("cloneReq did not correctly deep copy the URL")
+	}
+}
+
+func TestCloneURL(t *testing.T) {
+	originalURL, err := url.Parse("http://hostname.com/path")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clone := cloneURL(originalURL)
+
+	if originalURL == clone {
+		t.Fatalf("cloneReq should deep copy the URL")
+	}
+
+	if !reflect.DeepEqual(originalURL, clone) {
+		t.Fatalf("clone is not deeply equal to the originalURL")
+	}
 }
 
 func TestSuccessfulTokenRequest(t *testing.T) {
@@ -126,6 +182,36 @@ func TestSuccessfulTokenAuthorization(t *testing.T) {
 
 	rtoken := &RequestToken{Token: "RTOKEN", Secret: "RSECRET"}
 	atoken, err := c.AuthorizeToken(rtoken, "VERIFICATION_CODE")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	assertEq(t, "ATOKEN", atoken.Token)
+	assertEq(t, "ATOKEN_SECRET", atoken.Secret)
+	assertEq(t, "SESSION_HANDLE", atoken.AdditionalData["oauth_session_handle"])
+	assertEq(t, "consumersecret&RSECRET", m.signer.UsedKey)
+}
+
+func TestSuccessfulTokenAuthorizationWithoutVerifier(t *testing.T) {
+	c := basicConsumer()
+	m := newMocks(t)
+	m.install(c)
+
+	m.httpClient.ExpectGet(
+		"http://www.mrjon.es/accesstoken",
+		map[string]string{
+			"oauth_consumer_key":     "consumerkey",
+			"oauth_nonce":            "2",
+			"oauth_signature":        "MOCK_SIGNATURE",
+			"oauth_signature_method": "HMAC-SHA1",
+			"oauth_timestamp":        "1",
+			"oauth_token":            "RTOKEN",
+			"oauth_version":          "1.0",
+		},
+		"oauth_token=ATOKEN&oauth_token_secret=ATOKEN_SECRET&oauth_session_handle=SESSION_HANDLE")
+
+	rtoken := &RequestToken{Token: "RTOKEN", Secret: "RSECRET"}
+	atoken, err := c.AuthorizeToken(rtoken, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -954,6 +1040,82 @@ func TestSemicolonInParameters_NewApi(t *testing.T) {
 	assertEq(t, "BODY:SUCCESS", string(body))
 }
 
+func TestBodyHashStandard(t *testing.T) {
+	m := newMocks(t)
+
+	req, err := http.NewRequest("POST", "http://www.mrjon.es/someurl", strings.NewReader(`foo=123`))
+	assertEq(t, nil, err)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	hash, err := calculateBodyHash(req, m.signer)
+	assertEq(t, nil, err)
+	assertEq(t, "", hash)
+
+	req, err = http.NewRequest("GET", "http://www.mrjon.es/someurl?foo=123", nil)
+	assertEq(t, nil, err)
+	hash, err = calculateBodyHash(req, m.signer)
+	assertEq(t, nil, err)
+	assertEq(t, "2jmj7l5rSw0yVb/vlWAYkK/YBwk=", hash)
+
+	req, err = http.NewRequest("GET", "http://www.mrjon.es/someurl?foo=123", strings.NewReader(""))
+	assertEq(t, nil, err)
+	hash, err = calculateBodyHash(req, m.signer)
+	assertEq(t, nil, err)
+	assertEq(t, "2jmj7l5rSw0yVb/vlWAYkK/YBwk=", hash)
+
+	req, err = http.NewRequest("GET", "http://www.mrjon.es/someurl?foo=123", strings.NewReader("Hello World!"))
+	assertEq(t, nil, err)
+	hash, err = calculateBodyHash(req, m.signer)
+	assertEq(t, nil, err)
+	assertEq(t, "Lve95gjOVATpfV8EL5X4nxwjKHE=", hash)
+
+}
+
+func TestParseBodyNonDestructive(t *testing.T) {
+	// copied from unexported http.Request.outgoingLength()
+	// https://github.com/golang/go/blob/release-branch.go1.8/src/net/http/request.go#L1311
+	outgoingLength := func(r *http.Request) int64 {
+		if r.Body == nil || r.Body == http.NoBody {
+			return 0
+		}
+		if r.ContentLength != 0 {
+			return r.ContentLength
+		}
+		return -1
+	}
+	const assertMsg = "Unexpected change in http.Request Body"
+
+	req, err := http.NewRequest("POST", "http://www.mrjon.es/someurl", strings.NewReader(`foo=123`))
+	assertEq(t, nil, err)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	len := outgoingLength(req)
+	_, err = parseBody(req)
+	assertEq(t, nil, err)
+	assertEqM(t, len, outgoingLength(req), assertMsg)
+
+	req, err = http.NewRequest("POST", "http://www.mrjon.es/someurl", strings.NewReader(""))
+	assertEq(t, nil, err)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	len = outgoingLength(req)
+	_, err = parseBody(req)
+	assertEq(t, nil, err)
+	assertEqM(t, len, outgoingLength(req), assertMsg)
+
+	req, err = http.NewRequest("GET", "http://www.mrjon.es/someurl?foo=123", nil)
+	assertEq(t, nil, err)
+	len = outgoingLength(req)
+	_, err = parseBody(req)
+	assertEq(t, nil, err)
+	assertEqM(t, len, outgoingLength(req), assertMsg)
+
+	req, err = http.NewRequest("GET", "http://www.mrjon.es/someurl", nil)
+	assertEq(t, nil, err)
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+	len = outgoingLength(req)
+	_, err = parseBody(req)
+	assertEq(t, nil, err)
+	assertEqM(t, len, outgoingLength(req), assertMsg)
+}
+
 func basicConsumer() *Consumer {
 	return NewConsumer(
 		"consumerkey",
@@ -1019,7 +1181,7 @@ func (mock *MockHttpClient) Do(req *http.Request) (*http.Response, error) {
 		if req.Header == nil {
 			mock.t.Fatal("Missing 'Authorization' header.")
 		}
-		mock.oAuthChecker.CheckHeader(req.Header.Get("Authorization"))
+		mock.oAuthChecker.CheckHeader(req.Header.Get(HTTP_AUTH_HEADER))
 	}
 
 	if len(mock.expectedHeaders) > 0 {
@@ -1163,8 +1325,19 @@ func (m *MockSigner) Sign(message string, tokenSecret string) (string, error) {
 	return "MOCK_SIGNATURE", nil
 }
 
+func (m *MockSigner) Verify(message string, signature string) error {
+	if signature != "MOCK_SIGNATURE" {
+		return fmt.Errorf("bad mock signature")
+	}
+	return nil
+}
+
 func (m *MockSigner) Debug(enabled bool) {}
 
 func (m *MockSigner) SignatureMethod() string {
-	return SIGNATURE_METHOD_HMAC_SHA1
+	return SIGNATURE_METHOD_HMAC + HASH_METHOD_MAP[m.HashFunc()]
+}
+
+func (m *MockSigner) HashFunc() crypto.Hash {
+	return crypto.SHA1
 }
