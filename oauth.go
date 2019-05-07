@@ -56,6 +56,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"github.com/mnovozhylov/randstr"
 )
 
 const (
@@ -1071,7 +1072,7 @@ func (c *Consumer) baseParams(consumerKey string, additionalParams map[string]st
 	params.Add(VERSION_PARAM, OAUTH_VERSION)
 	params.Add(SIGNATURE_METHOD_PARAM, c.signer.SignatureMethod())
 	params.Add(TIMESTAMP_PARAM, strconv.FormatInt(c.clock.Seconds(), 10))
-	params.Add(NONCE_PARAM, strconv.FormatInt(c.nonceGenerator.Int63(), 10))
+	params.Add(NONCE_PARAM, strconv.FormatInt(c.nonceGenerator.Int63(), 10) + "." + randstr.String(8))
 	params.Add(CONSUMER_KEY_PARAM, consumerKey)
 	for key, value := range additionalParams {
 		params.Add(key, value)
